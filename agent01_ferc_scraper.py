@@ -443,9 +443,18 @@ def write_to_airtable(data, item):
 
 
 # ── Main runner ────────────────────────────────────────────────────────────────
-def run_agent():
+def run_agent(progress=None):
     global NEWSAPI_QUERIES, GUARDIAN_QUERIES, ICP_SYSTEM_PROMPT
 
+    def emit(stage, message, current=0, total=0):
+        if progress:
+            try:
+                progress({"stage": stage, "message": message,
+                          "current": current, "total": total})
+            except Exception:
+                pass
+
+    emit("starting", "Loading configuration")
     print("=" * 60)
     print(f"Agent 01 - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
@@ -478,16 +487,22 @@ def run_agent():
     print("=" * 60)
     print()
 
+    emit("fetching", "Fetching signals from NewsAPI, Guardian and RSS feeds")
     all_items = fetch_all_signals(days_back=lookback)
     if not all_items:
         print("\nNo articles fetched.")
-        return
+        emit("done", "No articles fetched", 0, 0)
+        return {"fetched": 0, "relevant": 0, "tier1": 0, "tier2": 0,
+                "tier3": 0, "disqualified": 0, "new_leads": 0}
 
     print("\nFiltering for relevant signals...")
+    emit("filtering", f"Filtering {len(all_items)} articles", 0, len(all_items))
     relevant = filter_relevant(all_items)
     if not relevant:
         print("No relevant articles found.")
-        return
+        emit("done", "No relevant articles found", 0, 0)
+        return {"fetched": len(all_items), "relevant": 0, "tier1": 0,
+                "tier2": 0, "tier3": 0, "disqualified": 0, "new_leads": 0}
 
     print(f"\nScoring {len(relevant)} articles against ICP...")
     t1, t2, t3, disq = 0, 0, 0, 0
@@ -495,6 +510,7 @@ def run_agent():
     for i, item in enumerate(relevant):
         preview = item['title'][:60] + "..." if len(item['title']) > 60 else item['title']
         print(f"\n[{i+1}/{len(relevant)}] {preview}")
+        emit("scoring", f"Scoring: {preview}", i + 1, len(relevant))
         result = score_with_icp(item)
         if result:
             sc = result.get("icp_score")
@@ -513,6 +529,7 @@ def run_agent():
             print("  Not a relevant company - skipping")
             disq += 1
 
+    new_leads = t1 + t2 + t3
     print("\n" + "=" * 60)
     print(f"Run complete: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"  Total fetched:   {len(all_items)}")
@@ -522,6 +539,14 @@ def run_agent():
     print(f"  Tier 3:          {t3}  (nurture)")
     print(f"  Disqualified:    {disq}")
     print("=" * 60)
+
+    summary = {"fetched": len(all_items), "relevant": len(relevant),
+               "tier1": t1, "tier2": t2, "tier3": t3,
+               "disqualified": disq, "new_leads": new_leads}
+    emit("done",
+         f"Done — {new_leads} qualified lead(s): {t1} Tier 1, {t2} Tier 2, {t3} Tier 3",
+         len(relevant), len(relevant))
+    return summary
 
 
 if __name__ == "__main__":
