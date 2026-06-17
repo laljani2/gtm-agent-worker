@@ -83,17 +83,11 @@ Target organisations: {org_types}
 FIRMOGRAPHIC CRITERIA (must meet to score above 40):
 - Revenue / budget: {revenue}
 - Renewables portfolio: {min_portfolio}
-- Geographies: {geographies}
 - Tech environment: Multi-vendor SCADA/OEM stack, Maximo/EAM, SAP/Oracle ERP
 
-HARD GEOGRAPHY FILTER (overrides all other scoring):
-If the company does NOT operate in one of the geographies listed above
-({geographies}), you MUST cap the icp_score at 15 and set outreach_tier to
-"Disqualified" — regardless of how strong the other signals are. This is a
-non-negotiable filter. A perfect-fit US utility is still a disqualification
-if the geography list says Brazil only. When in doubt about a company's
-primary geography, infer it from the signal summary and source — and if you
-genuinely cannot tell, default to disqualifying rather than passing through.
+(Note: geography is evaluated by a separate stage after scoring — do not factor
+the company's country or region into icp_score here. Score purely on
+firmographic fit, signal strength, pain, and tech environment.)
 
 TARGET PERSONAS (the champion / economic buyer):
 {champion}
@@ -128,8 +122,6 @@ Return ONLY valid JSON, no markdown:
   "signal_summary": "2-3 sentences on what happened and why this company needs asset management software",
   "portfolio_mw": null,
   "asset_type": "Solar OR Wind OR BESS OR Mixed OR Unknown",
-  "geography": "North America OR West Europe OR APAC OR MEA OR Japan OR Unknown",
-  "region": "specific country if clearly mentioned (e.g. USA, Spain, India, Australia, UK, Germany, Japan, Brazil, UAE) — otherwise repeat the broad geography value above",
   "pain_indicators": "specific pain signals detected or none detected",
   "tech_environment": "technology mentions or none detected",
   "competitor_signals": "competitor tools mentioned or none detected",
@@ -156,7 +148,9 @@ ICP_DEFAULTS = {
 
 
 def build_icp_prompt(cfg):
-    """Fill the ICP template with Config values, falling back per-field."""
+    """Fill the ICP template with Config values, falling back per-field.
+    Geographies is intentionally excluded — geography is resolved in a separate
+    stage (resolve_geography) and filtered against parse_allowed_geographies()."""
     def pick(key):
         v = (cfg.get(key) or "").strip()
         return v if v else ICP_DEFAULTS[key]
@@ -164,11 +158,99 @@ def build_icp_prompt(cfg):
         org_types=pick("icp_org_types"),
         revenue=pick("icp_revenue"),
         min_portfolio=pick("icp_min_portfolio"),
-        geographies=pick("icp_geographies"),
         champion=pick("icp_champion"),
         core_pain=pick("icp_core_pain"),
         disqualifiers=pick("icp_disqualifiers"),
     )
+
+
+# ── Geography resolver — separate stage, looks up the COMPANY (not article) ──
+GEO_SYSTEM_PROMPT = """You identify where a company primarily operates.
+
+Return ONLY a JSON object, no markdown:
+{"country": "specific country if you are confident (e.g. USA, Spain, India, UK, Germany, Japan, Brazil, UAE, Australia, Mexico) — otherwise empty string",
+ "region":  "one of: North America, West Europe, APAC, MEA, Japan, LATAM — otherwise Unknown"}
+
+Base your answer on the company's primary operations, NOT where any specific
+news article was written or published. A US utility covered by a Brazilian
+trade publication is still in North America. If you genuinely cannot tell
+from the company name, return country="" and region="Unknown"."""
+
+
+def resolve_geography(company_name):
+    """Return {'country': str, 'region': str} for a company. Never raises."""
+    try:
+        resp = claude.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=80,
+            system=GEO_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": f"Company: {company_name}"}],
+        )
+        raw = resp.content[0].text.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        result = json.loads(raw)
+        country = (result.get("country") or "").strip()
+        region  = (result.get("region")  or "").strip() or "Unknown"
+        return {"country": country, "region": region}
+    except Exception as e:
+        print(f"    Geography resolver error: {e}")
+        return {"country": "", "region": "Unknown"}
+
+
+# Map of region keywords → which "broad region" they imply, so user-typed
+# Geographies strings like "North America, West Europe" can be matched against
+# resolved {country, region} pairs without exact-string fragility.
+REGION_SYNONYMS = {
+    "north america": ["north america", "usa", "us", "united states", "canada", "mexico"],
+    "west europe":   ["west europe", "western europe", "europe", "uk", "united kingdom",
+                      "ireland", "spain", "portugal", "france", "germany", "italy",
+                      "netherlands", "belgium", "switzerland", "austria", "denmark",
+                      "sweden", "norway", "finland"],
+    "apac":          ["apac", "asia", "asia-pacific", "australia", "india", "china",
+                      "south korea", "taiwan", "singapore", "indonesia", "philippines",
+                      "thailand", "vietnam", "malaysia", "new zealand"],
+    "mea":           ["mea", "middle east", "africa", "uae", "saudi arabia", "egypt",
+                      "south africa", "morocco", "kenya", "nigeria", "israel", "qatar"],
+    "japan":         ["japan"],
+    "latam":         ["latam", "latin america", "south america", "brazil", "argentina",
+                      "chile", "colombia", "peru", "uruguay"],
+}
+
+
+def parse_allowed_geographies(raw):
+    """Turn the user-typed Geographies string into a set of allowed region keys."""
+    if not raw:
+        return set()
+    text = raw.lower()
+    allowed = set()
+    for region_key, synonyms in REGION_SYNONYMS.items():
+        if any(syn in text for syn in synonyms):
+            allowed.add(region_key)
+    return allowed
+
+
+def geography_matches(resolved, allowed_regions):
+    """Decide if a resolved {country, region} passes the allow-list.
+    Unknown always passes (per design: pass-through with region='Unknown')."""
+    if not allowed_regions:
+        return True  # no filter configured
+    region_str  = (resolved.get("region")  or "").lower()
+    country_str = (resolved.get("country") or "").lower()
+    if "unknown" in region_str or not region_str:
+        return True  # pass through ambiguous companies
+    # check the broad region first
+    for region_key in allowed_regions:
+        if region_key in region_str:
+            return True
+        # also check country synonyms (e.g. "Brazil" matches "latam")
+        for syn in REGION_SYNONYMS.get(region_key, []):
+            if syn and syn in country_str:
+                return True
+    return False
 
 
 def parse_queries(raw):
@@ -518,7 +600,12 @@ def run_agent(progress=None):
                 "tier2": 0, "tier3": 0, "disqualified": 0, "new_leads": 0}
 
     print(f"\nScoring {len(relevant)} articles against ICP...")
-    t1, t2, t3, disq = 0, 0, 0, 0
+    allowed_geos = parse_allowed_geographies(cfg.get("icp_geographies", ""))
+    if allowed_geos:
+        print(f"Geography filter active: {sorted(allowed_geos)}")
+    else:
+        print("Geography filter: none (no Geographies set in Config)")
+    t1, t2, t3, disq, geo_filtered = 0, 0, 0, 0, 0
 
     for i, item in enumerate(relevant):
         preview = item['title'][:60] + "..." if len(item['title']) > 60 else item['title']
@@ -532,6 +619,22 @@ def run_agent(progress=None):
                 elif sc >= thr2: result["outreach_tier"] = "Tier 2"
                 elif sc >= 25:   result["outreach_tier"] = "Tier 3"
                 else:            result["outreach_tier"] = "Disqualified"
+
+            # ── Geography stage — only run if the lead would otherwise pass ──
+            if isinstance(sc, int) and sc >= 25:
+                company_name = (result.get("company_name") or "").strip()
+                if company_name and company_name.lower() not in ("null", "none", "unknown"):
+                    print(f"  Resolving geography for {company_name}...")
+                    geo = resolve_geography(company_name)
+                    result["region"]    = geo["country"] or geo["region"]
+                    result["geography"] = geo["region"]
+                    if not geography_matches(geo, allowed_geos):
+                        print(f"  Geography filtered out ({geo['country'] or geo['region']}) — not written")
+                        geo_filtered += 1
+                        disq += 1
+                        continue
+                    print(f"  Geography ok: {result['region']}")
+
             tier = result.get("outreach_tier", "")
             if "Tier 1" in tier:   t1 += 1
             elif "Tier 2" in tier: t2 += 1
@@ -545,12 +648,13 @@ def run_agent(progress=None):
     new_leads = t1 + t2 + t3
     print("\n" + "=" * 60)
     print(f"Run complete: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"  Total fetched:   {len(all_items)}")
-    print(f"  Keyword match:   {len(relevant)}")
-    print(f"  Tier 1:          {t1}  (immediate outreach)")
-    print(f"  Tier 2:          {t2}  (queue this week)")
-    print(f"  Tier 3:          {t3}  (nurture)")
-    print(f"  Disqualified:    {disq}")
+    print(f"  Total fetched:        {len(all_items)}")
+    print(f"  Keyword match:        {len(relevant)}")
+    print(f"  Geography filtered:   {geo_filtered}")
+    print(f"  Tier 1:               {t1}  (immediate outreach)")
+    print(f"  Tier 2:               {t2}  (queue this week)")
+    print(f"  Tier 3:               {t3}  (nurture)")
+    print(f"  Disqualified:         {disq}")
     print("=" * 60)
 
     summary = {"fetched": len(all_items), "relevant": len(relevant),
