@@ -86,6 +86,15 @@ FIRMOGRAPHIC CRITERIA (must meet to score above 40):
 - Geographies: {geographies}
 - Tech environment: Multi-vendor SCADA/OEM stack, Maximo/EAM, SAP/Oracle ERP
 
+HARD GEOGRAPHY FILTER (overrides all other scoring):
+If the company does NOT operate in one of the geographies listed above
+({geographies}), you MUST cap the icp_score at 15 and set outreach_tier to
+"Disqualified" — regardless of how strong the other signals are. This is a
+non-negotiable filter. A perfect-fit US utility is still a disqualification
+if the geography list says Brazil only. When in doubt about a company's
+primary geography, infer it from the signal summary and source — and if you
+genuinely cannot tell, default to disqualifying rather than passing through.
+
 TARGET PERSONAS (the champion / economic buyer):
 {champion}
 
@@ -120,6 +129,7 @@ Return ONLY valid JSON, no markdown:
   "portfolio_mw": null,
   "asset_type": "Solar OR Wind OR BESS OR Mixed OR Unknown",
   "geography": "North America OR West Europe OR APAC OR MEA OR Japan OR Unknown",
+  "region": "specific country if clearly mentioned (e.g. USA, Spain, India, Australia, UK, Germany, Japan, Brazil, UAE) — otherwise repeat the broad geography value above",
   "pain_indicators": "specific pain signals detected or none detected",
   "tech_environment": "technology mentions or none detected",
   "competitor_signals": "competitor tools mentioned or none detected",
@@ -424,6 +434,9 @@ def write_to_airtable(data, item):
     if data.get("portfolio_mw") is not None:
         try:                           record["Portfolio MW"]    = float(data["portfolio_mw"])
         except (ValueError, TypeError): pass
+    region = (data.get("region") or data.get("geography") or "").strip()
+    if region and region.lower() not in ("null", "none", "unknown"):
+        record["Region"] = region
 
     notes = []
     if data.get("company_type"):       notes.append(f"Type: {data['company_type']}")
