@@ -222,34 +222,49 @@ REGION_SYNONYMS = {
 
 
 def parse_allowed_geographies(raw):
-    """Turn the user-typed Geographies string into a set of allowed region keys."""
+    """Turn the user-typed Geographies string into two sets:
+       - explicit countries the user named (e.g. 'india', 'uk')
+       - broad regions the user named (e.g. 'apac', 'mea')
+    A company passes if its country/region matches either set."""
     if not raw:
-        return set()
+        return {"countries": set(), "regions": set()}
     text = raw.lower()
-    allowed = set()
+    regions   = set()
+    countries = set()
     for region_key, synonyms in REGION_SYNONYMS.items():
-        if any(syn in text for syn in synonyms):
-            allowed.add(region_key)
-    return allowed
+        for syn in synonyms:
+            if syn in text:
+                # if the synonym IS the broad region name, treat as region match;
+                # otherwise the user named a specific country
+                if syn == region_key or syn in ("western europe", "asia-pacific",
+                                                "latin america", "south america",
+                                                "middle east", "asia", "europe", "africa"):
+                    regions.add(region_key)
+                else:
+                    countries.add(syn)
+    return {"countries": countries, "regions": regions}
 
 
-def geography_matches(resolved, allowed_regions):
-    """Decide if a resolved {country, region} passes the allow-list.
-    Unknown always passes (per design: pass-through with region='Unknown')."""
-    if not allowed_regions:
-        return True  # no filter configured
+def geography_matches(resolved, allowed):
+    """Pass if resolved country matches a named country, OR resolved region
+    matches a named broad region. Unknown always passes (design choice)."""
+    if not allowed or (not allowed["countries"] and not allowed["regions"]):
+        return True
     region_str  = (resolved.get("region")  or "").lower()
     country_str = (resolved.get("country") or "").lower()
-    if "unknown" in region_str or not region_str:
-        return True  # pass through ambiguous companies
-    # check the broad region first
-    for region_key in allowed_regions:
-        if region_key in region_str:
+    if "unknown" in region_str or (not region_str and not country_str):
+        return True
+    # Specific country match — checks if any allowed country appears in
+    # the resolved country string (so 'uk' matches 'United Kingdom')
+    for c in allowed["countries"]:
+        if c and c in country_str:
             return True
-        # also check country synonyms (e.g. "Brazil" matches "latam")
-        for syn in REGION_SYNONYMS.get(region_key, []):
-            if syn and syn in country_str:
-                return True
+        # also allow country->country: "Middle East" written by user as text
+        # already became a region; specific country like 'uae' would be here
+    # Broad region match
+    for r in allowed["regions"]:
+        if r and r in region_str:
+            return True
     return False
 
 
@@ -601,8 +616,13 @@ def run_agent(progress=None):
 
     print(f"\nScoring {len(relevant)} articles against ICP...")
     allowed_geos = parse_allowed_geographies(cfg.get("icp_geographies", ""))
-    if allowed_geos:
-        print(f"Geography filter active: {sorted(allowed_geos)}")
+    if allowed_geos["countries"] or allowed_geos["regions"]:
+        parts = []
+        if allowed_geos["countries"]:
+            parts.append(f"countries: {sorted(allowed_geos['countries'])}")
+        if allowed_geos["regions"]:
+            parts.append(f"regions: {sorted(allowed_geos['regions'])}")
+        print(f"Geography filter active — {' | '.join(parts)}")
     else:
         print("Geography filter: none (no Geographies set in Config)")
     t1, t2, t3, disq, geo_filtered = 0, 0, 0, 0, 0
